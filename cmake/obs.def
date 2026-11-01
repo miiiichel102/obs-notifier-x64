@@ -1,0 +1,15 @@
+LIBRARY obs
+EXPORTS
+    blog
+    bfree
+    obs_module_get_config_path
+    obs_get_signal_handler
+    signal_handler_connect
+    signal_handler_disconnect
+    obs_enum_hotkey_bindings
+    obs_hotkey_binding_get_hotkey
+    obs_hotkey_binding_get_key_combination
+    obs_hotkey_get_registerer_type
+    obs_hotkey_get_name
+    obs_key_to_virtual_key
+    config_get_string

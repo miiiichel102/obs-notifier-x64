@@ -1,0 +1,15 @@
+LIBRARY obs-frontend-api
+EXPORTS
+    obs_frontend_get_main_window
+    obs_frontend_add_tools_menu_qaction
+    obs_frontend_add_event_callback
+    obs_frontend_remove_event_callback
+    obs_frontend_get_last_replay
+    obs_frontend_replay_buffer_start
+    obs_frontend_replay_buffer_stop
+    obs_frontend_replay_buffer_save
+    obs_frontend_replay_buffer_active
+    obs_frontend_streaming_active
+    obs_frontend_recording_active
+    obs_frontend_virtualcam_active
+    obs_frontend_get_user_config
