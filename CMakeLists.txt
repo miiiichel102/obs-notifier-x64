@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 set(CMAKE_MSVC_RUNTIME_LIBRARY MultiThreadedDLL)
-project(obs-notifier VERSION 1.3.0 LANGUAGES CXX)
+project(obs-notifier VERSION 1.4.0 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "OBS Notifier currently requires Windows x64 and the MSVC toolchain.")
@@ -38,7 +38,7 @@ target_compile_definitions(notifier-ui PUBLIC QT_NO_KEYWORDS)
 
 configure_file(src/resources.rc.in "${CMAKE_BINARY_DIR}/generated/resources.rc" @ONLY)
 set_source_files_properties("${CMAKE_BINARY_DIR}/generated/resources.rc" PROPERTIES
-    OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/assets/notification-chime.wav")
+    OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/assets/on.wav;${CMAKE_SOURCE_DIR}/assets/off.wav;${CMAKE_SOURCE_DIR}/assets/saved.wav")
 add_library(obs-notifier MODULE src/plugin.cpp src/shortcut-monitor.cpp "${CMAKE_BINARY_DIR}/generated/resources.rc")
 add_dependencies(obs-notifier obs-imports)
 target_link_libraries(obs-notifier PRIVATE notifier-ui obs-api)

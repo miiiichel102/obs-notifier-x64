@@ -1,1 +1,3 @@
-101 WAVE "@CMAKE_SOURCE_DIR@/assets/notification-chime.wav"
+101 WAVE "@CMAKE_SOURCE_DIR@/assets/on.wav"
+102 WAVE "@CMAKE_SOURCE_DIR@/assets/off.wav"
+103 WAVE "@CMAKE_SOURCE_DIR@/assets/saved.wav"

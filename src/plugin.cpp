@@ -89,6 +89,12 @@ public:
                 filename = QString::fromUtf8(path);
                 bfree(path);
             }
+        } else if (event == OBS_FRONTEND_EVENT_RECORDING_STOPPED) {
+            char *path = obs_frontend_get_last_recording();
+            if (path) {
+                filename = QString::fromUtf8(path);
+                bfree(path);
+            }
         }
         if (event == OBS_FRONTEND_EVENT_EXIT) {
             self->exiting_ = true;
@@ -159,7 +165,8 @@ private:
             [this](const Settings &s, Kind kind) {
                 toast_->setSettings(s);
                 previewing_ = true;
-                toast_->showNotice({kind, QStringLiteral("Replay - great moment.mkv")}, true);
+                toast_->showNotice({kind, kind == Kind::RecordingStopped ? QStringLiteral("Recording - full session.mkv")
+                                                                       : QStringLiteral("Replay - great moment.mkv")}, true);
             });
         connect(dialog_, &QDialog::finished, this, [this] {
             if (toast_ && previewing_)

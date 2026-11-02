@@ -2,6 +2,7 @@
 
 #include <QApplication>
 #include <QEvent>
+#include <QDir>
 #include <QFileInfo>
 #include <QFontMetrics>
 #include <QGuiApplication>
@@ -9,6 +10,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QScreen>
+#include <QtMath>
 #include <QWindow>
 #include <algorithm>
 #include <cmath>
@@ -19,17 +21,51 @@
 
 namespace obs_notifier {
 namespace {
-constexpr int CardWidth = 460;
-constexpr int CardHeight = 104;
-constexpr int EnterMs = 220;
-constexpr int LeaveMs = 180;
-constexpr int ChimeResourceId = 101;
-constexpr int ChimeDurationMs = 720;
+// Card layout in logical units for a 1920 x 1080 display at 100% size.
+// The whole card is scaled at paint time (see Toast::place).
+constexpr double ReferenceLongSide = 1920.0;
+constexpr double ReferenceShortSide = 1080.0;
+constexpr double MinResolutionScale = 0.5;
+constexpr double MaxResolutionScale = 3.0;
+constexpr double CornerRadius = 6.0;
+constexpr double AccentWidth = 4.0;
+constexpr double IconArtwork = 52.0; // icon artwork spans about 52 units
+constexpr double IconGap = 11.0;
+constexpr double TextRight = 16.0;
+constexpr double PaddingY = 9.0;
+constexpr double MinCardWidth = 160.0;
+constexpr double MaxCardWidth = 420.0;
+constexpr int EnterMs = 280;
+constexpr int LeaveMs = 220;
+constexpr int ReplaceMs = 240;
+constexpr double SlideDistance = 32.0;
+constexpr double ReplaceDimOpacity = 0.35; // a replacement fades in from at most this
+constexpr double ReplaceSlide = 0.3;       // and slides in from at least this
+// WAVE resources from resources.rc.in.
+constexpr int SoundOnId = 101;    // soft rising swoosh
+constexpr int SoundOffId = 102;   // soft falling swoosh
+constexpr int SoundSavedId = 103; // soft tap
+int soundResource(SoundEvent event)
+{
+    switch (event) {
+    case SoundEvent::Saved: return SoundSavedId;
+    case SoundEvent::Stop: return SoundOffId;
+    case SoundEvent::Start: break;
+    }
+    return SoundOnId;
+}
 
 double smoothStep(double t)
 {
     t = std::clamp(t, 0.0, 1.0);
     return t * t * t * (t * (6.0 * t - 15.0) + 10.0);
+}
+
+// Starts moving immediately and settles gently, so the entry never hesitates.
+double easeOut(double t)
+{
+    t = 1.0 - std::clamp(t, 0.0, 1.0);
+    return 1.0 - t * t * t;
 }
 
 Kind iconKind(Kind kind)
@@ -59,31 +95,104 @@ QColor blend(const QColor &a, const QColor &b, double amount)
                            a.blueF() * (1 - amount) + b.blueF() * amount);
 }
 
-QString noticeSubtitle(Kind kind, const QString &filename, bool showFilename)
+// Only a saved clip or finished recording carries a second line: its filename, when enabled.
+QString noticeDetail(const Notice &notice, bool showFilename)
 {
-    switch (kind) {
-    case Kind::ReplayStarted: return QStringLiteral("Ready to capture your next moment");
-    case Kind::ReplayStopped: return QStringLiteral("Replay capture has stopped");
-    case Kind::ReplaySaved:
-        return showFilename && !filename.isEmpty() ? QFileInfo(filename).fileName()
-                                                   : QStringLiteral("Your replay is ready");
-    case Kind::StreamingStarted: return QStringLiteral("You are live");
-    case Kind::StreamingStopped: return QStringLiteral("Your live stream has ended");
-    case Kind::RecordingStarted: return QStringLiteral("Your recording is running");
-    case Kind::RecordingStopped: return QStringLiteral("Your recording has finished");
-    case Kind::VirtualCameraStarted: return QStringLiteral("Ready for your camera apps");
-    case Kind::VirtualCameraStopped: return QStringLiteral("Virtual camera output has stopped");
-    case Kind::ReplayAlreadyRunning: return QStringLiteral("Replay capture is still running");
-    case Kind::ReplayAlreadyStopped: return QStringLiteral("Replay capture is already stopped");
-    case Kind::StreamingAlreadyRunning: return QStringLiteral("Your stream is still live");
-    case Kind::StreamingAlreadyStopped: return QStringLiteral("There is no active stream to stop");
-    case Kind::RecordingAlreadyRunning: return QStringLiteral("Your recording is still running");
-    case Kind::RecordingAlreadyStopped: return QStringLiteral("There is no active recording to stop");
-    case Kind::VirtualCameraAlreadyRunning: return QStringLiteral("Virtual camera output is still running");
-    case Kind::VirtualCameraAlreadyStopped: return QStringLiteral("Virtual camera output is already stopped");
-    }
+    if ((notice.kind == Kind::ReplaySaved || notice.kind == Kind::RecordingStopped) && showFilename && !notice.filename.isEmpty())
+        return QFileInfo(notice.filename).fileName();
     return {};
 }
+
+QStringList fontFamilies(const Settings &settings)
+{
+    if (!settings.fontFamily.isEmpty())
+        return {settings.fontFamily};
+    return {QStringLiteral("Segoe UI Variable Text"), QStringLiteral("Segoe UI")};
+}
+
+QFont makeFont(const Settings &settings, int pixelSize, int weight)
+{
+    QFont font = qApp->font();
+    font.setFamilies(fontFamilies(settings));
+    font.setPixelSize(std::max(1, pixelSize));
+    font.setWeight(static_cast<QFont::Weight>(weight));
+    font.setHintingPreference(QFont::PreferNoHinting); // scales smoothly with the card
+    return font;
+}
+
+// All card metrics derive from the configured text size so the card stays tight.
+struct CardLayout {
+    QFont label, title, detail;
+    double labelHeight, titleHeight, detailHeight;
+    double iconSize, iconCenterX, textLeft;
+};
+
+CardLayout cardLayout(const Settings &settings)
+{
+    CardLayout l;
+    const int size = settings.fontSize;
+    l.label = makeFont(settings, qRound(size * 0.64), 600);
+    l.title = makeFont(settings, size, settings.titleWeight);
+    l.detail = makeFont(settings, qRound(size * 0.86), 400);
+    l.labelHeight = std::ceil(QFontMetricsF(l.label).height());
+    l.titleHeight = std::ceil(QFontMetricsF(l.title).height());
+    l.detailHeight = std::ceil(QFontMetricsF(l.detail).height());
+    l.iconSize = l.labelHeight + l.titleHeight;
+    l.iconCenterX = AccentWidth + IconGap + l.iconSize / 2;
+    l.textLeft = l.iconCenterX + l.iconSize / 2 + IconGap;
+    return l;
+}
+
+// Scales the card so it covers the same share of every display: 1.0 on 1080p,
+// about 1.33 on 1440p, 2.0 on 4K. Uses logical pixels, so Windows display
+// scaling is already accounted for. Portrait displays are handled by comparing
+// the long and short sides separately.
+double resolutionScale(const QScreen *screen)
+{
+    const QSize size = screen->geometry().size();
+    const double longSide = std::max(size.width(), size.height());
+    const double shortSide = std::min(size.width(), size.height());
+    if (longSide <= 0 || shortSide <= 0)
+        return 1.0;
+    return std::clamp(std::min(longSide / ReferenceLongSide, shortSide / ReferenceShortSide),
+                      MinResolutionScale, MaxResolutionScale);
+}
+}
+
+SoundEvent soundEvent(Kind kind)
+{
+    switch (kind) {
+    case Kind::ReplaySaved:
+        return SoundEvent::Saved;
+    case Kind::ReplayStopped: case Kind::StreamingStopped: case Kind::RecordingStopped:
+    case Kind::VirtualCameraStopped: case Kind::ReplayAlreadyStopped:
+    case Kind::StreamingAlreadyStopped: case Kind::RecordingAlreadyStopped:
+    case Kind::VirtualCameraAlreadyStopped:
+        return SoundEvent::Stop;
+    default:
+        return SoundEvent::Start;
+    }
+}
+
+bool playNoticeSound(SoundEvent event, const Settings &settings)
+{
+    // A chosen .wav file wins; if it is missing or unreadable, fall back to the built-in sound.
+    const QString file = settings.soundFile(event);
+    if (!file.isEmpty() && QFileInfo(file).isFile() &&
+        PlaySoundW(reinterpret_cast<LPCWSTR>(QDir::toNativeSeparators(file).utf16()), nullptr,
+                   SND_FILENAME | SND_ASYNC | SND_NODEFAULT))
+        return true;
+    HMODULE module = nullptr;
+    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                              reinterpret_cast<LPCWSTR>(&soundResource), &module) &&
+           PlaySoundW(MAKEINTRESOURCEW(soundResource(event)), module,
+                      SND_RESOURCE | SND_ASYNC | SND_NODEFAULT);
+}
+
+void stopNoticeSound()
+{
+    PlaySoundW(nullptr, nullptr, 0);
 }
 
 QString noticeTitle(Kind kind)
@@ -145,8 +254,8 @@ Toast::~Toast()
     animating_ = false;
     holdTimer_.stop();
 
-    if (chimeElapsed_.isValid() && chimeElapsed_.elapsed() < ChimeDurationMs)
-        PlaySoundW(nullptr, nullptr, 0);
+    if (chimeElapsed_.isValid())
+        stopNoticeSound();
 }
 
 void Toast::setSettings(const Settings &settings)
@@ -158,6 +267,7 @@ void Toast::setSettings(const Settings &settings)
 void Toast::refreshTheme()
 {
     colors_ = obsWindow_ ? obsWindow_->palette() : qApp->palette();
+    cardDirty_ = true;
     update();
 }
 
@@ -165,6 +275,8 @@ void Toast::dismissAll()
 {
     animating_ = false;
     holdTimer_.stop();
+    opacity_ = 0.0;
+    slide_ = 0.0;
     hide();
 }
 
@@ -198,17 +310,30 @@ void Toast::place()
     auto *screen = targetScreen();
     if (!screen)
         return;
+    if (!windowHandle())
+        winId(); // create the native window so the first notice lands on the right screen
     const auto area = screen->availableGeometry();
-    effectiveScale_ = std::min({settings_.scale / 100.0,
-                                area.width() / double(CardWidth + 16),
-                                area.height() / double(CardHeight + 16)});
-    const QSize cardSize(qRound(CardWidth * effectiveScale_), qRound(CardHeight * effectiveScale_));
+    const double resolution = resolutionScale(screen);
+    cardSize_ = cardSize();
+    effectiveScale_ = std::min({resolution * settings_.scale / 100.0,
+                                area.width() / (cardSize_.width() + 16),
+                                area.height() / (cardSize_.height() + 16)});
+    const QSize scaledSize(qCeil(cardSize_.width() * effectiveScale_),
+                           qCeil(cardSize_.height() * effectiveScale_));
 
-    resize(cardSize + QSize(1, 0));
+    // The window spans the whole slide so the animation only repaints, never
+    // moves the native window: position and opacity land in the same frame.
+    travel_ = qCeil(SlideDistance * effectiveScale_);
+    const bool left = leftCorner(settings_.corner);
+    restX_ = left ? travel_ : 0.0;
+    cardDirty_ = true;
+
+    resize(scaledSize + QSize(travel_ + 1, 0));
     if (windowHandle())
         windowHandle()->setScreen(screen);
-    anchor_ = anchoredRect(area, cardSize, settings_.corner, settings_.margin).topLeft();
-    move(anchor_);
+    const int margin = qRound(settings_.margin * resolution);
+    anchor_ = anchoredRect(area, scaledSize, settings_.corner, margin).topLeft();
+    move(anchor_ - QPoint(left ? travel_ : 0, 0));
 }
 
 void Toast::showNotice(Notice notice, bool preview)
@@ -216,14 +341,23 @@ void Toast::showNotice(Notice notice, bool preview)
     if (!preview && !settings_.accepts(notice.kind))
         return;
 
-    animateEntry_ = !isVisible();
+    if (isVisible()) {
+        // Replacing a notice that is still on screen: dim it first, then swap the
+        // content and size, and animate in from where it currently is.
+        entryMs_ = ReplaceMs;
+        entryFromOpacity_ = std::min(opacity_, ReplaceDimOpacity);
+        entryFromSlide_ = std::max(slide_, ReplaceSlide);
+    } else {
+        entryMs_ = EnterMs;
+        entryFromOpacity_ = 0.0;
+        entryFromSlide_ = 1.0;
+    }
     animating_ = false;
     holdTimer_.stop();
     current_ = std::move(notice);
     refreshTheme();
     place();
     holdMs_ = qRound(settings_.seconds * 1000);
-    setWindowOpacity(animateEntry_ ? 0.0 : 1.0);
 
     const auto handle = reinterpret_cast<HWND>(winId());
     windowHandle()->installEventFilter(this);
@@ -233,16 +367,9 @@ void Toast::showNotice(Notice notice, bool preview)
     SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     elapsed_.start();
-    if (settings_.sound) {
-        HMODULE module = nullptr;
-
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                              reinterpret_cast<LPCWSTR>(&ChimeResourceId), &module) &&
-            PlaySoundW(MAKEINTRESOURCEW(ChimeResourceId), module,
-                       SND_RESOURCE | SND_ASYNC | SND_NODEFAULT))
-            chimeElapsed_.start();
-    }
+    if (settings_.sound && settings_.soundEnabled(soundEvent(current_.kind)) &&
+        playNoticeSound(soundEvent(current_.kind), settings_))
+        chimeElapsed_.start();
     tick();
     update();
 }
@@ -265,31 +392,27 @@ bool Toast::eventFilter(QObject *watched, QEvent *event)
 void Toast::tick()
 {
     const double ms = elapsed_.nsecsElapsed() / 1000000.0;
-    const int entryMs = animateEntry_ ? EnterMs : 0;
+    const int entryMs = entryMs_;
     double opacity = 1.0;
     double slide = 0.0;
     if (ms < entryMs) {
-        const double t = ms / double(entryMs);
-        const double eased = smoothStep(t);
-        opacity = eased;
-        slide = 1.0 - eased;
+        const double eased = easeOut(ms / double(entryMs));
+        opacity = entryFromOpacity_ + (1.0 - entryFromOpacity_) * eased;
+        slide = entryFromSlide_ * (1.0 - eased);
     } else if (ms > entryMs + holdMs_) {
         const double t = std::min(1.0, (ms - entryMs - holdMs_) / double(LeaveMs));
         slide = smoothStep(t);
         opacity = 1.0 - slide;
     }
     if (ms >= entryMs + holdMs_ + LeaveMs) {
-        animating_ = false;
-        holdTimer_.stop();
-        hide();
+        dismissAll();
         return;
     }
-    setWindowOpacity(opacity);
+    opacity_ = opacity;
+    slide_ = slide;
     const int direction = leftCorner(settings_.corner) ? -1 : 1;
-    const double x = direction * 32 * effectiveScale_ * slide;
-    const int wholeX = static_cast<int>(std::floor(x));
-    fractionalX_ = x - wholeX;
-    move(anchor_ + QPoint(wholeX, 0));
+    offsetX_ = restX_ + direction * travel_ * slide;
+    update(); // painted in this same frame: tick() runs before the update request is delivered
     if (ms >= entryMs && ms < entryMs + holdMs_) {
 
         animating_ = false;
@@ -300,24 +423,51 @@ void Toast::tick()
     }
 }
 
-void Toast::drawCard(QPainter &p) const
+QSizeF Toast::cardSize() const
 {
-    p.setRenderHint(QPainter::Antialiasing);
-    const auto background = colors_.color(QPalette::Active, QPalette::Window);
-    const auto foreground = colors_.color(QPalette::Active, QPalette::WindowText);
-    auto accent = colors_.color(QPalette::Active, QPalette::Highlight);
+    const CardLayout l = cardLayout(settings_);
+    double textWidth = std::max(QFontMetricsF(l.label).horizontalAdvance(QStringLiteral("OBS")),
+                                QFontMetricsF(l.title).horizontalAdvance(noticeTitle(current_.kind)));
+    double height = PaddingY + l.labelHeight + l.titleHeight + PaddingY;
+    const auto detail = noticeDetail(current_, settings_.showFilename);
+    if (!detail.isEmpty()) {
+        textWidth = std::max(textWidth, QFontMetricsF(l.detail).horizontalAdvance(detail));
+        height += l.detailHeight;
+    }
+    const double maxWidth = std::max(MaxCardWidth, l.textLeft + TextRight + 120);
+    const double width = std::clamp(std::ceil(l.textLeft + textWidth + TextRight), MinCardWidth, maxWidth);
+    return {width, height};
+}
 
-    if (std::abs(accent.lightnessF() - background.lightnessF()) < 0.12)
+void Toast::drawCard(QPainter &p, const QSizeF &size) const
+{
+    const double w = size.width();
+    const double h = size.height();
+    const CardLayout l = cardLayout(settings_);
+    p.setRenderHint(QPainter::Antialiasing);
+    const bool custom = settings_.customColors;
+    const auto background = custom ? settings_.backgroundColor : colors_.color(QPalette::Active, QPalette::Window);
+    const auto foreground = custom ? settings_.textColor : colors_.color(QPalette::Active, QPalette::WindowText);
+    auto accent = custom ? settings_.accentColor : colors_.color(QPalette::Active, QPalette::Highlight);
+
+    // Theme colours get a contrast fix; custom colours are used exactly as chosen.
+    if (!custom && std::abs(accent.lightnessF() - background.lightnessF()) < 0.12)
         accent = blend(accent, foreground, 0.42);
     const auto muted = blend(foreground, background, 0.34);
-    p.setPen(QPen(blend(background, foreground, 0.13), 1));
+    QColor border = blend(background, foreground, 0.13);
+    border.setAlphaF(background.alphaF());
+    p.setPen(QPen(border, 1));
     p.setBrush(background);
-    p.drawRoundedRect(QRectF(0.5, 0.5, CardWidth - 1, CardHeight - 1), 5, 5);
-    p.setClipRect(QRectF(0, 0, CardWidth, CardHeight));
-    p.fillRect(QRectF(0, 0, 5, CardHeight), accent);
+    p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), CornerRadius, CornerRadius);
+    QPainterPath card;
+    card.addRoundedRect(QRectF(0, 0, w, h), CornerRadius, CornerRadius);
+    QPainterPath strip;
+    strip.addRect(QRectF(0, 0, AccentWidth, h));
+    p.fillPath(card.intersected(strip), accent);
 
     p.save();
-    p.translate(53, 51);
+    p.translate(l.iconCenterX, h / 2);
+    p.scale(l.iconSize / IconArtwork, l.iconSize / IconArtwork);
     p.setPen(QPen(accent, 4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
     p.setBrush(Qt::NoBrush);
     const Kind icon = iconKind(current_.kind);
@@ -372,47 +522,59 @@ void Toast::drawCard(QPainter &p) const
     }
     p.restore();
 
-    QFont labelFont = qApp->font();
-    labelFont.setPixelSize(10);
-    labelFont.setWeight(QFont::DemiBold);
-    labelFont.setLetterSpacing(QFont::AbsoluteSpacing, 1.5);
-    p.setFont(labelFont);
+    const double textWidth = w - l.textLeft - TextRight;
+    const auto detail = noticeDetail(current_, settings_.showFilename);
+    double y = PaddingY;
+
+    p.setFont(l.label);
     p.setPen(muted);
-    p.drawText(QRectF(98, 15, 340, 17), Qt::AlignVCenter | Qt::AlignLeft,
+    p.drawText(QRectF(l.textLeft, y, textWidth, l.labelHeight), Qt::AlignVCenter | Qt::AlignLeft,
                QStringLiteral("OBS"));
+    y += l.labelHeight;
 
-    QFont titleFont = qApp->font();
-    titleFont.setPixelSize(23);
-    titleFont.setWeight(QFont::Medium);
-    p.setFont(titleFont);
+    p.setFont(l.title);
     p.setPen(foreground);
-    p.drawText(QRectF(97, 34, 343, 32), Qt::AlignVCenter | Qt::AlignLeft,
-               noticeTitle(current_.kind));
+    p.drawText(QRectF(l.textLeft, y, textWidth + TextRight, l.titleHeight), Qt::AlignVCenter | Qt::AlignLeft,
+               QFontMetricsF(l.title).elidedText(noticeTitle(current_.kind), Qt::ElideRight, textWidth));
+    y += l.titleHeight;
 
-    const auto subtitle = noticeSubtitle(current_.kind, current_.filename, settings_.showFilename);
-    QFont detailFont = qApp->font();
-    detailFont.setPixelSize(12);
-    p.setFont(detailFont);
-    p.setPen(muted);
-    p.drawText(QRectF(98, 69, 340, 19), Qt::AlignVCenter | Qt::AlignLeft,
-               QFontMetrics(detailFont).elidedText(subtitle, Qt::ElideMiddle, 340));
+    if (!detail.isEmpty()) {
+        p.setFont(l.detail);
+        p.setPen(muted);
+        p.drawText(QRectF(l.textLeft, y, textWidth, l.detailHeight), Qt::AlignVCenter | Qt::AlignLeft,
+                   QFontMetricsF(l.detail).elidedText(detail, Qt::ElideMiddle, textWidth));
+    }
 }
 
 void Toast::paintEvent(QPaintEvent *)
 {
+    const double dpr = devicePixelRatioF();
+    const QSize pixels(qCeil(cardSize_.width() * effectiveScale_ * dpr) + 1,
+                       qCeil(cardSize_.height() * effectiveScale_ * dpr));
+    if (cardDirty_ || cardImage_.size() != pixels) {
+        // Fading a cached image keeps overlapping shapes from showing through.
+        cardImage_ = QImage(pixels, QImage::Format_ARGB32_Premultiplied);
+        cardImage_.setDevicePixelRatio(dpr);
+        cardImage_.fill(Qt::transparent);
+        QPainter cp(&cardImage_);
+        cp.scale(effectiveScale_, effectiveScale_);
+        drawCard(cp, cardSize_);
+        cardDirty_ = false;
+    }
     QPainter p(this);
-    p.translate(fractionalX_, 0.0);
-    p.scale(effectiveScale_, effectiveScale_);
-    drawCard(p);
+    p.setRenderHint(QPainter::SmoothPixmapTransform); // sub-pixel motion
+    p.setOpacity(opacity_);
+    p.drawImage(QPointF(offsetX_, 0.0), cardImage_);
 }
 
 QImage Toast::snapshot() const
 {
-    QImage image(CardWidth * 2, CardHeight * 2, QImage::Format_ARGB32_Premultiplied);
+    const QSizeF size = cardSize();
+    QImage image(qCeil(size.width() * 2), qCeil(size.height() * 2), QImage::Format_ARGB32_Premultiplied);
     image.fill(Qt::transparent);
     QPainter painter(&image);
     painter.scale(2, 2);
-    drawCard(painter);
+    drawCard(painter, size);
     return image;
 }
 }
